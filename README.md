@@ -1,160 +1,101 @@
-# XierluoEPUB_Sigil
+# FontEncrypt
 
-个人制作、更新的Sigil插件合集，制作部分均为自制，更新部分为对部分开源插件的更新
+Sigil EPUB 编辑器插件 -- 对 EPUB 中的主文本部分进行字体混淆加密，小幅度提高破解难度
 
-## CryFont
+## 功能
 
-**自制**
+- 对选定章节的 CJK 正文进行字体混淆加密
+- 按章节动态收集实际出现的字符，仅混淆所需字符，避免字体过大或码位不足
+- 全角字符（汉字、全角标点）映射到 CJK 码位，半角字符映射到 BMP PUA 区，保持排版宽度一致
+- 自动生成随机映射的 TTF 字体文件，支持复合字形分解
+- 自动注入 `@font-face` CSS 规则到已有样式表（全局统一类名，避免冗余）
+- 支持排除特定 HTML 元素（标题、脚注、脚本、样式、代码块等）不参与混淆，Emoji 字符自动跳过
+- 多看阅读兼容：自动注入 U+7684（的）字形，确保多看正确识别为 CJK 字体
 
-主要作用为对EPUB中的主文本部分进行文本混淆加密，小幅度提高破解难度
+> **注意：** 使用前请确保 EPUB 正文**没有内嵌字体**。如果正文已通过 CSS 指定了内嵌字体，内嵌字体会覆盖插件生成的加密字体，导致混淆后的文本无法正常渲染。请先移除正文的内嵌字体设置，再运行插件。
 
-##### *使用方案：*
+## 原理
 
-下载Release中对应的压缩包即可使用，github代码仅包含插件主体，未包含所有支持项
+1. 读取字体 (可自定义)，提取 CJK 字符的字形数据（自动分解复合字形）
+2. 按字符宽度分类：全角字符分配 CJK 扩展区码位，半角字符分配 PUA 私有区码位
+3. 构建新字体：新码位 -> 原字符字形
+4. 将 HTML 正文字符替换为新码位的 Unicode 字符
+5. 注入 `@font-face` CSS 使新字体生效
+6. 阅读器加载自定义字体正常显示，源码中只有随机码位
 
-Release中的ttf文件为模板字体文件，可以自行替换为其他字体文件。
+### 全角/半角分离映射
 
-##### *代码解析：*
+插件会自动判断每个字符的 East Asian Width 属性：
 
-代码段由三个部分组成：
+- **全角字符** (W/F)：汉字、全角标点等 -> 映射到 CJK 统一汉字区 (U+3400-U+4DBF, U+4E00-U+9FFF)
+- **半角字符**：ASCII 标点、拉丁字母等 -> 映射到 BMP 私有使用区 (U+E000-U+F8FF)
 
-1、简单文件名混淆
+这样确保混淆后的字符在各阅读器中保持与原字符一致的显示宽度，避免标点间距异常。
 
-```python
-a = os.urandom(32)
-b = base64.encodebytes(a).decode('utf8')
-c = re.findall('[a-zA-Z]*', b)
-ttf_name = ''.join(c)
-```
+### 多看阅读器兼容
 
-2、混淆ttf文件生成与使用
+多看阅读器通过检测 U+7684（"的"）码位是否有字形来判断字体是否为 CJK 字体。插件会自动将"的"字的字形注入到生成的混淆字体中（即使正文不包含"的"字），确保多看正确加载字体并显示正文。
 
-```python
-# 生成ttf文件并导入
-cry_fonts_list = obfuscate_plus(easy_font, ttf_name)
-bk.addfile(ttf_name + ".ttf", ttf_name + ".ttf", f.read())
+### XHTML 处理策略
 
-# 生成新的css文件调用字体
-def make_new_css(bk, html_file_name_list, ttf_name):
-    base_name = RandomName()
-    css_fmt = '@font-face {font-family: "cry_font_##";\n' \
-                   'src: url(../Fonts/' + ttf_name + ".ttf" + ');}\n'
-    css_fmt += '.cry_font_##{font-family: cry_font_##;}\n'
-    css_content = ""
-    for html_file_name in html_file_name_list:
-        css_content += css_fmt.replace("##", html_file_name)
+插件采用混合策略处理 XHTML：
 
-    bk.addfile(
-        uniqueid=base_name, basename=f"{base_name}.css",
-        data=css_content, mime="text/css"
-    )
-    return f"style/{base_name}.css"
-```
+1. **DOM 路径（主路径）**：使用 ElementTree 解析 XHTML，在 DOM 节点级别执行文本翻译（只修改 `.text` 和 `.tail`，不触及 HTML 属性）。自动跳过 `<script>`、`<style>`、`<code>`、`<pre>` 等标签的内容。只序列化 `<body>` 元素并拼接回原始字符串，保留声明头、`<html>` 属性、`<head>` 区域和命名空间声明的原始格式。
+2. **正则回退路径**：对于 XML 解析失败的格式异常 XHTML，使用简化的正则方案，只翻译标签之间的文本内容。同样保护 `<script>`/`<style>`/`<code>`/`<pre>` 块不被翻译。
 
-3、混淆文字替换
+## 排除混淆的 HTML 元素
 
-```python
-book = bk.readfile(Id)
-book = re.sub(
-    "</head>",
-    f'<link href="{css_href}" rel="stylesheet" type="text/css"/>\n</head>',
-    book, 0, re.S
-)
-book = re.sub(
-    r'<body.*?>.*</body>',
-    lambda x: Convert(x, cry_fonts_dict, href.split(".")[0]),
-    book, 0, re.S
-)
-bk.writefile(Id, book)
-```
+插件通过标签名和 class 属性判断保护特定 HTML 元素不参与字体混淆。被排除的元素内容保持原文不变。
 
-##### *实现效果：*
+### 当前排除规则
 
-原始情况
+| 规则 | 匹配示例 |
+|------|----------|
+| `<h1>` - `<h6>` | `<h2>第一章</h2>` |
+| `<script>` | `<script>...</script>` |
+| `<style>` | `<style>...</style>` |
+| `<code>` | `<code>var x = 1;</code>` |
+| `<pre>` | `<pre>预格式化文本</pre>` |
+| `class` 含 `cut` | `<p class="cut">...</p>` |
+| `class` 含 `int` | `<p class="right int">...</p>` |
+| `class` 含 `spe` | `<span class="spe">...</span>` |
+| `class` 以 `-Regular` 结尾 | `<span class="FZKai-Regular">...</span>` |
+| `class` 含 `zhangyue-footnote` | 自闭合 img 标签 |
+| `class` 含 `duokan-footnote-item` | 含内部 `<p>` 的 li |
+| Emoji 字符 | 自动跳过，不参与字符映射 |
 
-```html
-<head>
-    <title></title>
-    <link href="style/base_css.css" rel="stylesheet" type="text/css"/>
-</head>
-<body>
-    <p>啊—......好累。</p>
-    <p>在这如蒸炉般炎热的七月天中，大概没人愿意动弹吧。</p>
-    <p>『爱丽丝舞台』的活动结束已经过去两天，但我的兴奋还未结束。</p>
-    <p>一闭上眼，那天的欢呼，压倒性的演出什么的，现在还历历在目。</p>
-    <p>还有，SD由奈酱的可爱姿态。</p>
-    <p>于是，第二节课的体育课，就改成旁观学习了。（译：見学，旁观学习，就是上课的时候在旁边请假摸鱼的意思）</p>
-    <p>“诶......游一。你果然也在那天活动上耗尽了全力吗”</p>
-</body>
-```
+### 如何添加自定义排除规则
 
-混淆情况
-
-```html
-<head>
-  <title></title>
-    <link href="style/base_css.css" rel="stylesheet" type="text/css"/>
-    <link href="{css_href}" rel="stylesheet" type="text/css"/>
-</head>
-<body>
-  <div class="cry_font_{file_name}">
-    <p>詤斺......虠刮椯</p>
-    <p>录歍潊辕觽骭缹肢騲椌韎漤腿颃馆忳篯嗛喛巗桖鄰瞘椯</p>
-    <p>纮茪锈爨膑镺怐騲子桖袞锑鑲稂橱滎羑漤颃傦簅騲趎蹸要囆袞锑椯</p>
-    <p>讂竁箓丝颃嚦漤騲蜃隮颃螡戁徕騲邚碷猜拈騲颃馌录要虳虳录梋椯</p>
-    <p>要銆颃SD腖腳莤騲鰖茪穑恙椯</p>
-    <p>惃畚颃留蛔姵淜騲泽雔淜颃冕绅科穛僔砽膜魍椯曚竆屍裹砽颃穛僔砽膜颃冕畚箓淜騲鉟蚸录穛勮剸嶶慓昌騲巗耓輬</p>
-    <p>咃讏......錈讂椯李楲飏蟕录嚦漤子桖箓缸靎魍學耽椶揗</p>
-  </div>
-</body>
-```
-
-效果图(v1版本)
-![Image v1](https://github.com/Nihility-Protoss/XierluoEPUB_Sigil/blob/main/img_README/CryFont.png)
-
-效果图(v2版本)
-![Image v2](https://github.com/Nihility-Protoss/XierluoEPUB_Sigil/blob/main/img_README/CryFont_v2.png)
-
-注：注意到标题使用了 `<p class="pius1">` 通过css发现该css有如下定义：
-
-```css
-@font-face{
-    font-family: "illus1";
-    src: url(../Fonts/illus1.ttf);
-}
-.pius1{
-    font-family: illus1;
-}
-```
-
-而解密的css有如下内容：
-
-```css
-@font-face {
-    font-family: "cry_font_General0001";
-    src: url(../Fonts/voxsZAIBvxlsZBLFgqpzXBYILUnXmqPJmKc.ttf);
-}
-.cry_font_General0001{
-    font-family: cry_font_General0001;
-}
-```
-
-即因为font-family进行字体家族设置导致的冲突，解密的css无法顺利运行
-
-## font
-
-更新，原代码发布在：[天使动漫（无语大佬）](https://www.tsdm39.net/forum.php?mod=viewthread&tid=971897&mobile=yes)
-
-针对原本需要自己手动修改用户名地址的问题，进行了一点点优化，现在能够不修改直接使用了
-
-##### *核心更新代码：*
+编辑 `plugin.py` 中的以下常量：
 
 ```python
-# 更新前
-# HOMEPATH需要使用者手动更换
-os.chdir('C:\\home\$HOMEPATH\AppData\Local\sigil-ebook\sigil\plugins\\font')
-
-# 更新后
-user_path = os.getenv('HOMEPATH')
-os.chdir('C:' + user_path + '\AppData\Local\sigil-ebook\sigil\plugins\\font')
+# 需要排除的标签名
+_EXCLUDE_TAGS = frozenset({'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'script', 'style', 'code', 'pre'})
+# 需要排除的 class 值
+_EXCLUDE_CLASSES = frozenset({'cut', 'int', 'spe', 'duokan-footnote-item', 'zhangyue-footnote'})
+# 需要排除的 class 后缀
+_EXCLUDE_CLASS_SUFFIX = '-Regular'
 ```
+
+### 自定义混淆字符集
+
+编辑 `characters.txt` 文件，添加或移除需要参与混淆的字符。每个字符直接排列，无分隔符。插件启动时会自动加载该文件。
+
+## 安全性分析
+
+### 加密强度
+
+这是**字体混淆**，而非密码学加密。它通过自定义字体的码位重映射来隐藏明文，可以提高人工阅读和普通爬虫的破解成本，但**无法对抗有针对性的逆向分析**。
+
+### 可逆性
+
+| 拥有的资源 | 是否可还原 |
+|---|---|
+| 字体 + HTML | **可完全还原** |
+| 仅 HTML，无字体文件 | 无法还原 |
+| 仅字体文件，无 HTML | 无意义 |
+
+## 系统要求
+
+- Sigil 0.9.4+
+- Python 3.7+
